@@ -11,6 +11,7 @@ import (
 
 	"github.com/kevin-chtw/tw_client/message"
 	"github.com/kevin-chtw/tw_client/packet"
+	"github.com/kevin-chtw/tw_proto/cproto"
 	"github.com/topfreegames/pitaya/v3/pkg/conn/codec"
 	"github.com/topfreegames/pitaya/v3/pkg/logger"
 	"github.com/topfreegames/pitaya/v3/pkg/util/compression"
@@ -38,6 +39,8 @@ type pendingRequest struct {
 type Client struct {
 	conn      net.Conn
 	Connected bool
+	UserID    string
+	ServerID  string
 }
 
 // 创建客户端
@@ -54,7 +57,88 @@ func NewClient(addr string) (*Client, error) {
 	return c, nil
 }
 
-// 发送消息
+// Login 发送登录请求并处理响应
+func (c *Client) Login(req *cproto.LoginReq) (*cproto.LoginAck, error) {
+	// 序列化请求为JSON
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("序列化登录请求失败: %v", err)
+	}
+
+	msg := &message.Message{
+		Type:  message.Request,
+		ID:    uint(time.Now().UnixNano() & 0xFFFFFFFF),
+		Route: "account.account.verify",
+		Data:  reqData,
+	}
+	log.Printf("Sending request message: Type=%d, Route=%s", msg.Type, msg.Route)
+
+	// 发送请求
+	if err := c.Send(msg); err != nil {
+		return nil, fmt.Errorf("发送登录请求失败: %v", err)
+	}
+
+	// 接收响应
+	resp, err := c.Receive()
+	if err != nil {
+		return nil, fmt.Errorf("接收登录响应失败: %v", err)
+	}
+
+	// 反序列化响应
+	ack := &cproto.LoginAck{}
+	if err := json.Unmarshal(resp.Data, ack); err != nil {
+		return nil, fmt.Errorf("解析登录响应失败: %v", err)
+	}
+
+	if ack.Userid == "" {
+		return nil, fmt.Errorf("登录失败")
+	}
+
+	c.UserID = ack.Userid
+	c.ServerID = ack.Serverid
+	return ack, nil
+}
+
+// Register 发送注册请求并处理响应
+func (c *Client) Register(req *cproto.LobbyReq) (*cproto.LobbyAck, error) {
+	// 序列化请求为JSON
+	reqData, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("序列化注册请求失败: %v", err)
+	}
+
+	msg := &message.Message{
+		Type:  message.Request,
+		ID:    uint(time.Now().UnixNano() & 0xFFFFFFFF),
+		Route: "lobby.lobby.playermsg",
+		Data:  reqData,
+	}
+	log.Printf("Sending request message: Type=%d, Route=%s", msg.Type, msg.Route)
+
+	// 发送请求
+	if err := c.Send(msg); err != nil {
+		return nil, fmt.Errorf("发送注册请求失败: %v", err)
+	}
+
+	// 接收响应
+	resp, err := c.Receive()
+	if err != nil {
+		return nil, fmt.Errorf("接收注册响应失败: %v", err)
+	}
+
+	// 反序列化响应
+	ack := &cproto.LobbyAck{}
+	if err := json.Unmarshal(resp.Data, ack); err != nil {
+		return nil, fmt.Errorf("解析注册响应失败: %v", err)
+	}
+
+	if ack.RegisterAck == nil || ack.RegisterAck.Userid == "" {
+		return nil, fmt.Errorf("注册失败")
+	}
+
+	c.UserID = ack.RegisterAck.Userid
+	return ack, nil
+}
 func (c *Client) Send(msg *message.Message) error {
 	data, err := message.Encode(msg)
 	if err != nil {
@@ -84,17 +168,25 @@ func (c *Client) Receive() (*message.Message, error) {
 		return nil, err
 	}
 
-	p, err := packet.Decode(buf[:n])
+	pkts, err := packet.Decode(buf[:n])
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("packet decode failed: %v", err)
 	}
-	for i := 0; i < len(p); i++ {
-		msg, err := message.Decode(p[i].Data)
-		if err != nil {
-			return nil, err
+
+	for _, pkt := range pkts {
+		if pkt.Type != packet.Data {
+			continue
 		}
-		log.Printf("Received message: Type=%d, ID=%d, Route=%s, Data=%s\n", msg.Type, msg.ID, msg.Route, string(msg.Data))
+
+		msg, err := message.Decode(pkt.Data)
+		if err != nil {
+			return nil, fmt.Errorf("message decode failed: %v", err)
+		}
+
+		log.Printf("Received message: Type=%d, ID=%d, Route=%s\n", msg.Type, msg.ID, msg.Route)
+		return msg, nil
 	}
+
 	return nil, message.ErrInvalidMessage
 }
 
