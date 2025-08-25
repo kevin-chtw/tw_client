@@ -11,6 +11,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 file(GLOB_RECURSE SRC_FILES 
     "src/*.cpp"
     "include/*.hpp"
+    "proto/*.cc"
+    "proto/*.h"
 )
 
 # 静态库
@@ -19,11 +21,16 @@ add_library(pitaya_native STATIC ${SRC_FILES})
 target_include_directories(pitaya_native 
     PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/proto
 )
+
+# 查找protobuf库
+find_package(Protobuf REQUIRED)
+include_directories(${PROTOBUF_INCLUDE_DIRS})
 
 # 可执行文件
 add_executable(pitaya_main src/main.cpp)
-target_link_libraries(pitaya_main pitaya_native)
+target_link_libraries(pitaya_main pitaya_native ${PROTOBUF_LIBRARIES} protobuf)
 
 # 编译选项
 if(MSVC)
