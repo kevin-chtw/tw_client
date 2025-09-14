@@ -3,17 +3,20 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
-	"time"
+	"sync"
+	"sync/atomic"
 
 	"github.com/kevin-chtw/tw_client/message"
 	"github.com/kevin-chtw/tw_client/packet"
-	"github.com/kevin-chtw/tw_proto/cproto"
+	"github.com/sirupsen/logrus"
 	"github.com/topfreegames/pitaya/v3/pkg/conn/codec"
 	"github.com/topfreegames/pitaya/v3/pkg/logger"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/topfreegames/pitaya/v3/pkg/util/compression"
 )
 
@@ -30,17 +33,22 @@ type HandshakeData struct {
 	Sys  HandshakeSys `json:"sys"`
 }
 
-type pendingRequest struct {
-	msg    *message.Message
-	sentAt time.Time
+type sendTask struct {
+	msg *message.Message
+	// 对于 Request 用 respCh 回传结果；Notify 无回调
+	respCh chan *message.Message
 }
 
 // 客户端结构体
 type Client struct {
 	conn      net.Conn
+	stopCh    chan struct{}
+	sendCh    chan sendTask
 	Connected bool
-	UserID    string
-	ServerID  string
+	pendMu    sync.Mutex
+	pending   map[uint]chan *message.Message
+	idSeq     atomic.Uint32
+	onMsg     func(*message.Message)
 }
 
 // 创建客户端
@@ -50,144 +58,126 @@ func NewClient(addr string) (*Client, error) {
 		return nil, err
 	}
 
-	c := &Client{conn: conn}
+	c := &Client{
+		conn:    conn,
+		stopCh:  make(chan struct{}),
+		sendCh:  make(chan sendTask, 128),
+		pending: make(map[uint]chan *message.Message),
+	}
+
 	if err := c.handleHandshake(); err != nil {
+		conn.Close()
 		return nil, err
 	}
+
+	go c.readLoop()
+	go c.writeLoop()
 	return c, nil
 }
 
-// Login 发送登录请求并处理响应
-func (c *Client) Login(req *cproto.LoginReq) (*cproto.LoginAck, error) {
-	// 序列化请求为JSON
-	reqData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("序列化登录请求失败: %v", err)
-	}
+// OnMessage 设置收到推送/广播时的回调
+func (c *Client) OnMessage(fn func(*message.Message)) { c.onMsg = fn }
 
-	msg := &message.Message{
-		Type:  message.Request,
-		ID:    uint(time.Now().UnixNano() & 0xFFFFFFFF),
-		Route: "account.account.verify",
-		Data:  reqData,
-	}
-	log.Printf("Sending request message: Type=%d, Route=%s", msg.Type, msg.Route)
-
-	// 发送请求
-	if err := c.Send(msg); err != nil {
-		return nil, fmt.Errorf("发送登录请求失败: %v", err)
-	}
-
-	// 接收响应
-	resp, err := c.Receive()
-	if err != nil {
-		return nil, fmt.Errorf("接收登录响应失败: %v", err)
-	}
-
-	// 反序列化响应
-	ack := &cproto.LoginAck{}
-	if err := json.Unmarshal(resp.Data, ack); err != nil {
-		return nil, fmt.Errorf("解析登录响应失败: %v", err)
-	}
-
-	if ack.Userid == "" {
-		return nil, fmt.Errorf("登录失败")
-	}
-
-	c.UserID = ack.Userid
-	c.ServerID = ack.Serverid
-	return ack, nil
+// Notify 发一条不需要回包的消息（支持 protobuf）
+func (c *Client) Notify(route string, msg proto.Message) error {
+	b, _ := proto.Marshal(msg)
+	return c.NotifyBytes(route, b)
 }
 
-// Register 发送注册请求并处理响应
-func (c *Client) Register(req *cproto.LobbyReq) (*cproto.LobbyAck, error) {
-	// 序列化请求为JSON
-	reqData, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("序列化注册请求失败: %v", err)
+func (c *Client) NotifyBytes(route string, data []byte) error {
+	m := &message.Message{Type: message.Notify, Route: route, Data: data}
+	select {
+	case c.sendCh <- sendTask{msg: m}:
+		return nil
+	case <-c.stopCh:
+		return errors.New("client stopped")
 	}
-
-	msg := &message.Message{
-		Type:  message.Request,
-		ID:    uint(time.Now().UnixNano() & 0xFFFFFFFF),
-		Route: "lobby.lobby.playermsg",
-		Data:  reqData,
-	}
-	log.Printf("Sending request message: Type=%d, Route=%s", msg.Type, msg.Route)
-
-	// 发送请求
-	if err := c.Send(msg); err != nil {
-		return nil, fmt.Errorf("发送注册请求失败: %v", err)
-	}
-
-	// 接收响应
-	resp, err := c.Receive()
-	if err != nil {
-		return nil, fmt.Errorf("接收注册响应失败: %v", err)
-	}
-
-	// 反序列化响应
-	ack := &cproto.LobbyAck{}
-	if err := json.Unmarshal(resp.Data, ack); err != nil {
-		return nil, fmt.Errorf("解析注册响应失败: %v", err)
-	}
-
-	if ack.RegisterAck == nil || ack.RegisterAck.Userid == "" {
-		return nil, fmt.Errorf("注册失败")
-	}
-
-	c.UserID = ack.RegisterAck.Userid
-	return ack, nil
-}
-func (c *Client) Send(msg *message.Message) error {
-	data, err := message.Encode(msg)
-	if err != nil {
-		return err
-	}
-
-	buf, err := packet.Encode(packet.Data, data)
-	if err != nil {
-		log.Println("Failed to encode packet:", err)
-		return err
-	}
-
-	if _, err = c.conn.Write(buf); err != nil {
-		log.Println("Failed to send message:", err)
-	}
-	return err
 }
 
-// 接收消息
-func (c *Client) Receive() (*message.Message, error) {
-	buf := make([]byte, 1024)
-	n, err := c.conn.Read(buf)
-	if err != nil {
-		if err == io.EOF {
-			return nil, message.ErrInvalidMessage
-		}
-		return nil, err
+// Request 发一条需要回包的消息，返回 *Message future
+func (c *Client) Request(route string, msg proto.Message) (<-chan *message.Message, error) {
+	b, _ := proto.Marshal(msg)
+	return c.RequestBytes(route, b)
+}
+
+func (c *Client) RequestBytes(route string, data []byte) (<-chan *message.Message, error) {
+	id := c.idSeq.Add(1)
+	m := &message.Message{Type: message.Request, ID: uint(id), Route: route, Data: data}
+	ch := make(chan *message.Message, 1)
+
+	c.pendMu.Lock()
+	c.pending[uint(id)] = ch
+	c.pendMu.Unlock()
+
+	select {
+	case c.sendCh <- sendTask{msg: m, respCh: ch}:
+		return ch, nil
+	case <-c.stopCh:
+		return nil, errors.New("client stopped")
 	}
+}
 
-	pkts, err := packet.Decode(buf[:n])
-	if err != nil {
-		return nil, fmt.Errorf("packet decode failed: %v", err)
-	}
-
-	for _, pkt := range pkts {
-		if pkt.Type != packet.Data {
-			continue
-		}
-
-		msg, err := message.Decode(pkt.Data)
+// --------------------------------------------------
+// 读写循环
+// --------------------------------------------------
+func (c *Client) readLoop() {
+	defer c.Close()
+	buf := bytes.NewBuffer(nil)
+	for {
+		pkt, err := c.readPackets(buf)
 		if err != nil {
-			return nil, fmt.Errorf("message decode failed: %v", err)
+			return
 		}
-
-		log.Printf("Received message: Type=%d, ID=%d, Route=%s\n", msg.Type, msg.ID, msg.Route)
-		return msg, nil
+		for _, pkt := range pkt {
+			switch pkt.Type {
+			case packet.Heartbeat:
+				_ = c.NotifyBytes("sys.heartbeat", []byte("{}"))
+			case packet.Kick:
+				return
+			case packet.Data:
+				msg, err := message.Decode(pkt.Data)
+				if err != nil {
+					return
+				}
+				if msg.Type == message.Response {
+					c.pendMu.Lock()
+					ch := c.pending[msg.ID]
+					delete(c.pending, msg.ID)
+					c.pendMu.Unlock()
+					if ch != nil {
+						ch <- msg
+					}
+				} else if c.onMsg != nil {
+					c.onMsg(msg)
+				}
+			}
+		}
 	}
+}
 
-	return nil, message.ErrInvalidMessage
+func (c *Client) writeLoop() {
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case task := <-c.sendCh:
+			data, err := message.Encode(task.msg)
+			if err != nil {
+				return
+			}
+
+			buf, err := packet.Encode(packet.Data, data)
+			if err != nil {
+				logrus.Error("Failed to encode packet:", err.Error())
+				return
+			}
+
+			if _, err = c.conn.Write(buf); err != nil {
+				logrus.Error("Failed to send message:", err.Error())
+				return
+			}
+		}
+	}
 }
 
 // 关闭连接
