@@ -161,6 +161,17 @@ func (c *Client) writeLoop() {
 		case <-c.stopCh:
 			return
 		case task := <-c.sendCh:
+			if task.msg.Route == "sys.heartbeat" {
+				buf, err := packet.Encode(packet.Data, []byte(""))
+				if err != nil {
+					logrus.Error("Failed to encode packet:", err.Error())
+					return
+				}
+				if _, err = c.conn.Write(buf); err != nil {
+					logrus.Error("Failed to send message:", err.Error())
+					return
+				}
+			}
 			data, err := message.Encode(task.msg)
 			if err != nil {
 				return
