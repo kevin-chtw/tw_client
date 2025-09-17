@@ -213,7 +213,7 @@ func EnterGame(tableId int32) {
 	}
 
 	// 发送创建房间请求
-	_, err = g_client.Request("mjhaeb.player.message", req)
+	err = g_client.Notify("mjhaeb.player.message", req)
 	if err != nil {
 		fmt.Printf("进入房间失败: %v\n", err)
 		return
