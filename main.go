@@ -206,7 +206,6 @@ func EnterGame(tableId int32) {
 		return
 	}
 	req := &cproto.GameReq{
-		Gameid:  1001,
 		Matchid: 1001001,
 		Tableid: int32(tableId),
 		Req:     anyReq,
